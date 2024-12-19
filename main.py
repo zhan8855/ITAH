@@ -2,9 +2,8 @@ import math
 import random
 import sapiens
 import heapq
-from collections import defaultdict
+import pickle
 from dataclasses import dataclass
-from multiprocessing import Pool
 from argparse import ArgumentParser
 from tqdm import tqdm
 
@@ -14,9 +13,11 @@ def parse_args():
     parser = ArgumentParser(allow_abbrev=False)
     parser.add_argument("--method", default="greedy", choices=["greedy", "mcts", "itah"])
     parser.add_argument("--data_path", default="Hu-mAb_Results.csv", type=str)
-    parser.add_argument("--output_path", default="predictions.fasta", type=str)
+    parser.add_argument("--output_path", default="predictions", type=str)
     parser.add_argument("--graft", default="cdr", choices=["cdr", "vernier"])
-    parser.add_argument("--step", default=0, type=int)
+    parser.add_argument("--dedup", default=0, type=int)
+    parser.add_argument("--sort", default=0, type=int)
+    parser.add_argument("--step", default=1000, type=int)
     parser.add_argument("--seed", default=42, type=int)
     args = parser.parse_args()
     return args
@@ -26,16 +27,11 @@ def set_seed(seed):
 
 def calc_lm_score(chain, sequence):
     scores = sapiens.predict_scores(sequence, chain)
-    log_prod = sum([scores.iloc[idx][char] for idx, char in enumerate(sequence)])
-    return log_prod
-
-def calc_cdr_lm_score(chain, sequence, cdr_region):
-    scores = sapiens.predict_scores(sequence, chain)
-    log_prod = sum([scores.iloc[idx][char] for idx, char in enumerate(sequence) if cdr_region[idx]])
+    log_prod = sum([math.log(scores.iloc[idx][char]) for idx, char in enumerate(sequence)])
     return log_prod
 
 class MCTSNode:
-    def __init__(self, chain, sequence, graft, parent=None):
+    def __init__(self, chain, sequence, graft, parent=None, dedup=False, sort=False):
         self.chain = chain
         self.sequence = sequence
         self.graft = graft
@@ -43,6 +39,8 @@ class MCTSNode:
         self.children = []
         self.visits = 0
         self.value = 0.0
+        self.dedup = dedup
+        self.sort = sort
 
         scores = sapiens.predict_scores(sequence, chain)
 
@@ -51,11 +49,14 @@ class MCTSNode:
         for idx, candidate_scores in scores.iterrows():
             char = sequence[idx]
             original_score = candidate_scores[char]
-            self.score = self.score + original_score
+            self.score = self.score + math.log(original_score)
             if not self.graft[idx]:
-                self.candidates.extend([(idx, new_char, candidate_scores[new_char] - original_score)
+                self.candidates.extend([(idx, new_char, math.log(candidate_scores[new_char]) - math.log(original_score))
                                         for new_char, score in candidate_scores.items() if new_char != char])
-        self.candidates = sorted(self.candidates, key=lambda candidate: candidate[2])
+        if sort:
+            self.candidates = sorted(self.candidates, key=lambda candidate: candidate[2])
+        else:
+            random.shuffle(self.candidates)
         self.iter = len(self.candidates) - 1
 
     def is_fully_expanded(self):
@@ -70,12 +71,15 @@ class MCTSNode:
         new_sequence[idx] = new_char
         new_sequence = "".join(new_sequence)
         new_graft = list(self.graft)
-        new_graft[idx] = 1
+        if self.dedup:
+            new_graft[idx] = 1
         new_node = MCTSNode(
             chain=self.chain,
             sequence=new_sequence,
             graft=new_graft,
             parent=self,
+            dedup=self.dedup,
+            sort=self.sort
         )
         self.children.append(new_node)
         self.iter = self.iter - 1
@@ -99,19 +103,30 @@ class MCTS:
             node.update(reward)
             node = node.parent
 
-def greedy_predictor(chain, sequence, graft_region, step):
+def greedy_predictor(chain, sequence, graft_region, step, dedup, sort):
+    original_sequence = sequence
+    rewards = []
+    best_reward = 0
     for step_idx in range(step):
         new_sequence = sapiens.predict_best_score(sequence, chain)
         sequence = "".join([sequence[idx] if graft_region[idx] else new_sequence[idx] for idx in range(len(sequence))])
-    return sequence
+        reward = calc_lm_score(chain, sequence) - calc_lm_score(chain, original_sequence)
+        if reward > best_reward:
+            best_reward = reward
+            best_sequence = sequence
+        rewards.append(best_reward)
+    return best_sequence, rewards
 
-def mcts_predictor(chain, sequence, graft_region, step):
+def mcts_predictor(chain, sequence, graft_region, step, dedup, sort):
     mcts = MCTS()
     root = MCTSNode(
         chain=chain,
         sequence=sequence,
         graft=graft_region,
+        dedup=dedup,
+        sort=sort
     )
+    rewards = []
     best_reward = 0
     best_node = root
     init_score = root.score
@@ -122,17 +137,21 @@ def mcts_predictor(chain, sequence, graft_region, step):
         if reward > best_reward:
             best_reward = reward
             best_node = node
-    return best_node.sequence
+        rewards.append(best_reward)
+    return best_node.sequence, rewards
 
-def itah_predictor(chain, sequence, graft_region, step):
+def itah_predictor(chain, sequence, graft_region, step, dedup, sort):
     root = MCTSNode(
         chain=chain,
         sequence=sequence,
         graft=graft_region,
+        dedup=dedup,
+        sort=sort
     )
     node_list = [root]
     node_dict = {root.sequence: 1}
     node_size = 0
+    rewards = []
     best_reward = 0
     best_node = root
     heap = []
@@ -144,16 +163,17 @@ def itah_predictor(chain, sequence, graft_region, step):
         if reward > best_reward:
             best_reward = reward
             best_node = node
+        rewards.append(best_reward)
 
         new_node = node.expand()
-        if new_node.sequence not in node_dict:
+        if (new_node.sequence not in node_dict) or (not new_node.dedup):
             node_dict[new_node.sequence] = 1
             node_list.append(new_node)
             node_size = node_size + 1
             heapq.heappush(heap, (-(new_node.score + new_node.candidates[-1][2]), node_size))
         if not node.is_fully_expanded():
             heapq.heappush(heap, (-(node.score + node.candidates[node.iter][2]), node_idx))
-    return best_node.sequence
+    return best_node.sequence, rewards
 
 @dataclass
 class AntibodyData:
@@ -216,7 +236,7 @@ class AntibodyDataset:
         file.close()
 
     def predict(self):
-        predictions = {"H": [], "L": []}
+        predictions, rewards = {"H": [], "L": []}, {"H": [], "L": []}
         for chain, chain_dataset in self.dataset.items():
             for data in chain_dataset:
                 if self.args.graft == "cdr":
@@ -226,29 +246,34 @@ class AntibodyDataset:
                 else:
                     raise NotImplementedError
 
-                prediction = self.predictor(
+                prediction, reward = self.predictor(
                     chain=chain,
                     sequence=data.sequence,
                     graft_region=graft_region,
                     step=self.args.step,
+                    dedup=bool(self.args.dedup),
+                    sort=bool(self.args.sort)
                 )
                 predictions[chain].append(prediction)
-        self.save_predictions(predictions)
+                rewards[chain].append(reward)
+        self.save_predictions(predictions, rewards)
         return predictions
 
-    def save_predictions(self, predictions):
-        file = open(self.args.output_path, "w")
+    def save_predictions(self, predictions, rewards):
+        fasta_file = open(f"{self.args.output_path}.fasta", "w")
         for chain in predictions:
             for idx, prediction in enumerate(predictions[chain]):
-                print(f">Antibody{idx+1:02} V{chain}\n{prediction}", file=file)
-        file.close()
+                print(f">Antibody{idx+1:02} V{chain}\n{prediction}", file=fasta_file)
+        fasta_file.close()
+        pickle_file = open(f"{self.args.output_path}.pickle", "wb")
+        pickle.dump(rewards, file=pickle_file)
+        pickle_file.close()
 
     def evaluate(self, predictions):
         lm_score_improvement, cdr_lm_score_improvement, total_preservation, vernier_preservation, total_precision, vernier_precision = [], [], [], [], [], []
         for chain in self.dataset:
             for data, prediction in zip(self.dataset[chain], predictions[chain]):
                 lm_score_improvement.append(calc_lm_score(chain, prediction) - calc_lm_score(chain, data.sequence))
-                cdr_lm_score_improvement.append(calc_cdr_lm_score(chain, prediction, data.cdr_region) - calc_cdr_lm_score(chain, data.sequence, data.cdr_region))
                 total_preservation.append(sum([int(raw == pred) for raw, pred in zip(data.sequence, prediction)]) / len(data.sequence))
                 vernier_preservation.append(sum([int((raw == pred) and vernier) for raw, pred, vernier in zip(data.sequence, prediction, data.vernier_region)]) / sum(data.vernier_region))
                 total_precision.append(sum([int((pred == truth) and (raw != pred)) for raw, pred, truth in zip(data.sequence, prediction, data.label)]) /
@@ -259,7 +284,6 @@ class AntibodyDataset:
 
         return {
             "lm_score_improvement": sum(lm_score_improvement) / len(lm_score_improvement),
-            "cdr_lm_score_improvement": sum(cdr_lm_score_improvement) / len(cdr_lm_score_improvement),
             "total_preservation": sum(total_preservation) / len(total_preservation),
             "vernier_preservation": sum(vernier_preservation) / len(vernier_preservation),
             "total_precision": sum(total_precision) / len(total_precision),
@@ -270,10 +294,6 @@ def main(args):
     dataset = AntibodyDataset(args)
     dataset.load_data()
     predictions = dataset.predict()
-    #predictions = {
-    #    "H": [data.label for data in dataset.dataset["H"]],
-    #    "L": [data.label for data in dataset.dataset["L"]],
-    #}
     results = dataset.evaluate(predictions)
     return results
 
