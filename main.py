@@ -17,7 +17,7 @@ def parse_args():
     parser.add_argument("--graft", default="cdr", choices=["cdr", "vernier"])
     parser.add_argument("--dedup", default=0, type=int)
     parser.add_argument("--sort", default=0, type=int)
-    parser.add_argument("--step", default=1000, type=int)
+    parser.add_argument("--step", default=100, type=int)
     parser.add_argument("--seed", default=42, type=int)
     args = parser.parse_args()
     return args
@@ -27,7 +27,7 @@ def set_seed(seed):
 
 def calc_lm_score(chain, sequence):
     scores = sapiens.predict_scores(sequence, chain)
-    log_prod = sum([math.log(scores.iloc[idx][char]) for idx, char in enumerate(sequence)])
+    log_prod = sum([scores.iloc[idx][char] for idx, char in enumerate(sequence)])
     return log_prod
 
 class MCTSNode:
@@ -49,9 +49,9 @@ class MCTSNode:
         for idx, candidate_scores in scores.iterrows():
             char = sequence[idx]
             original_score = candidate_scores[char]
-            self.score = self.score + math.log(original_score)
+            self.score = self.score + original_score
             if not self.graft[idx]:
-                self.candidates.extend([(idx, new_char, math.log(candidate_scores[new_char]) - math.log(original_score))
+                self.candidates.extend([(idx, new_char, candidate_scores[new_char] - original_score)
                                         for new_char, score in candidate_scores.items() if new_char != char])
         if sort:
             self.candidates = sorted(self.candidates, key=lambda candidate: candidate[2])

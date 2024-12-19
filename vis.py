@@ -2,12 +2,12 @@ import numpy as np
 from matplotlib import pyplot as plt
 import pickle
 
-step = 1000
+step = 100
 files = [
     "greedy_pred",
     "mcts_pred",
     "ours_pred",
-    "ours_pred_no_sort",
+    "ours_pred_no_heurs",
     "ours_pred_no_dedup",
 ]
 colors = ["blue", "green", "red", "purple", "orange"]
@@ -29,7 +29,7 @@ for file, color in zip(files, colors):
 
 plt.xlabel("Step", fontsize=16)
 plt.ylabel("Value", fontsize=16)
-plt.title("LM Log Likelihood Increase", fontsize=20)
+plt.title("LM Score Increase", fontsize=20)
 plt.legend(fontsize=12)
 plt.savefig("plot.png")
 plt.show()
